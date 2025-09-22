@@ -1,0 +1,286 @@
+---
+
+  - name: Install required packages
+    apt:
+      name:
+      - curl
+      - git
+      - sudo
+      state: present
+    tags: package-install
+
+  - name: Ensure Docker service is started and enabled
+    systemd:
+      name: docker
+      state: started
+      enabled: yes
+    tags:
+    - docker-check
+    - docker-install
+
+  - name: Run Marzban installation script and send CTRL+C after completion
+    shell: |
+      # Устанавливаем переменные окружения
+      export MARZBAN_PATH="{{ marzban_install_dir }}"
+      export MARZBAN_DATA="{{ marzban_data_dir }}"
+
+      # Запускаем установку в фоновом режиме
+      bash -c "$(curl -sL https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh)" @ install &
+      INSTALL_PID=$!
+
+      # Ждем завершения установки (определяем по созданию docker-compose.yml)
+      timeout 300 bash -c "until [ -f {{ marzban_install_dir }}/docker-compose.yml ]; do sleep 5; done"
+
+      # Отправляем SIGINT (Ctrl+C) процессу установки
+      kill -INT $INSTALL_PID 2>/dev/null || true
+
+      # Даем процессу время на завершение
+      sleep 10
+    args:
+      executable: /bin/bash
+    tags: marzban-install
+
+  - name: Wait for Marzban to start
+    wait_for:
+      port: "{{ marzban_port }}"
+      host: "127.0.0.1"
+      delay: 10
+      timeout: 300
+    tags:
+    - marzban-wait
+    - marzban-install
+
+  - name: Create admin user using Marzban CLI
+    shell: |
+      cd {{ marzban_install_dir }}
+      # Создаем временный файл с ответами
+      cat > /tmp/marzban_admin_input.txt << EOF
+      {{ admin_username }}
+      {{ admin_password }}
+      {{ admin_password }}
+
+
+      EOF
+
+      # Выполняем команду создания администратора с передачей ответов
+      marzban cli admin create --sudo < /tmp/marzban_admin_input.txt
+
+      # Удаляем временный файл
+      rm -f /tmp/marzban_admin_input.txt
+    args:
+      executable: /bin/bash
+    no_log: true
+    tags: create-admin
+
+  - name: Install WARP tunnel
+    shell: |
+      # Создаем временный файл с ответами для интерактивного скрипта
+      cat > /tmp/warp_answers.txt << EOF
+      1
+      1
+      {{ warp_port }}
+      1
+      EOF
+
+
+      # Запускаем скрипт установки WARP с автоматическими ответами
+      timeout 600 bash -c 'cd /root && bash <(curl -fsSL https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh) w < /tmp/warp_answers.txt'
+
+      # Удаляем временный файл
+      rm -f /tmp/warp_answers.txt
+    args:
+      executable: /bin/bash
+    register: warp_install
+    changed_when: warp_install.rc == 0 or "'Congratulations' in warp_install.stdout"
+    failed_when: warp_install.rc != 0 and "'Congratulations' not in warp_install.stdout"
+    tags: warp-install
+
+  - name: Display WARP installation result
+    debug:
+      msg: "WARP tunnel installed successfully. SOCKS5 proxy available at 127.0.0.1:{{ warp_port }}"
+    when: "'Congratulations' in warp_install.stdout"
+    tags: warp-install
+
+  - name: Generate x25519 keys in Marzban container
+    shell: "docker exec marzban-marzban-1 xray x25519"
+    register: xray_keys
+    changed_when: false
+    tags: create_key
+
+  - name: Extract and display x25519 keys
+    block:
+    - name: Extract private key
+      set_fact:
+        xray_private_key: "{{ xray_keys.stdout | regex_search('Private key: (\\S+)', '\\1') | first }}"
+
+    - name: Extract public key
+      set_fact:
+        xray_public_key: "{{ xray_keys.stdout | regex_search('Public key: (\\S+)', '\\1') | first }}"
+
+    - name: Display x25519 keys
+      debug:
+        msg:
+        - "Private key: {{ xray_private_key }}"
+        - "Public key: {{ xray_public_key }}"
+      no_log: true
+    tags: create_key
+
+  - name: Save private key to file
+    copy:
+      content: "{{ xray_private_key }}"
+      dest: "/tmp/xray_private_key.txt"
+      mode: '0600'
+    when: xray_private_key is defined
+    tags: create_key
+
+  - name: Generate short ID
+    command: openssl rand -hex 8
+    register: short_id_result
+    changed_when: false
+    tags: shortid
+
+  - name: Extract and save short ID
+    set_fact:
+      short_id: "{{ short_id_result.stdout | trim }}"
+    tags: shortid
+
+  - name: Display short ID
+    debug:
+      msg: "Generated short ID: {{ short_id }}"
+    no_log: true
+    tags: shortid
+
+  - name: Remove existing XRay configuration file
+    file:
+      path: /var/lib/marzban/xray_config.json
+      state: absent
+    ignore_errors: yes # Игнорируем ошибки если файл не существует
+    tags: vlessconf
+
+  - name: Ensure directory exists
+    file:
+      path: /var/lib/marzban
+      state: directory
+      mode: '0755'
+      owner: root
+      group: root
+    tags: vlessconf
+
+  - name: Create XRay configuration file
+    copy:
+      content: |
+        {
+          "log": {
+            "loglevel": "warning"
+          },
+          "routing": {
+            "rules": [
+              {
+                "ip": [
+                  "geoip:private"
+                ],
+                "outboundTag": "BLOCK",
+                "type": "field"
+              },
+              {
+                "type": "field",
+                "port": "80, 443",
+                "outboundTag": "warp"
+              }
+            ]
+          },
+          "inbounds": [
+            {
+              "tag": "Shadowsocks TCP",
+              "listen": "0.0.0.0",
+              "port": 1080,
+              "protocol": "shadowsocks",
+              "settings": {
+                "clients": [],
+                "network": "tcp,udp"
+              }
+            },
+            {
+              "tag": "VLESS TCP REALITY",
+              "listen": "0.0.0.0",
+              "port": 2042,
+              "protocol": "vless",
+              "settings": {
+                "clients": [],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "tcp",
+                "tcpSettings": {},
+                "security": "reality",
+                "realitySettings": {
+                  "show": false,
+                  "dest": "tradingview.com:443",
+                  "xver": 0,
+                  "serverNames": [
+                    "tradingview.com"
+                  ],
+                  "privateKey": "{{ xray_private_key }}",
+                  "shortIds": [
+                    "",
+                    "{{ short_id }}"
+                  ]
+                }
+              },
+              "sniffing": {
+                "enabled": true,
+                "destOverride": [
+                  "http",
+                  "tls",
+                  "quic"
+                ]
+              }
+            }
+          ],
+          "outbounds": [
+            {
+              "protocol": "freedom",
+              "tag": "DIRECT"
+            },
+            {
+              "tag": "warp",
+              "protocol": "socks",
+              "settings": {
+                "servers": [
+                  {
+                    "address": "127.0.0.1",
+                    "port": {{ warp_port }}
+                  }
+                ]
+              }
+            },
+            {
+              "protocol": "blackhole",
+              "tag": "BLOCK"
+            }
+          ]
+        }
+      dest: /var/lib/marzban/xray_config.json
+      mode: '0644'
+      owner: root
+      group: root
+    tags: vlessconf
+
+  - name: Restart Marzban to apply new configuration
+    community.docker.docker_compose_v2:
+      project_src: "{{ marzban_install_dir }}"
+      state: restarted
+    when: marzban_install_dir is defined
+
+  - name: Display connection information
+    debug:
+      msg:
+      - "Marzban has been deployed successfully using official script!"
+      - "To access the panel, create an SSH tunnel:"
+      - "ssh -L {{ marzban_port }}:localhost:{{ marzban_port }} {{ ansible_user }}@{{ inventory_hostname }}"
+      - "Then open: http://localhost:{{ marzban_port }}/dashboard"
+      - "Username: {{ admin_username }}"
+      - "Password: {{ admin_password }}"
+      - ""
+      - "IMPORTANT: Change the default password after first login via cli (marzban cli admin update)!"
+    tags: display-info

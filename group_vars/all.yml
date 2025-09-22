@@ -1,0 +1,10 @@
+---
+# Настройки подключения
+ansible_user: root  
+
+# Настройки Marzban
+marzban_port: 8000
+warp_port: 54349
+marzban_data_dir: "/opt/marzban"
+admin_username: "admin"
+admin_password: "65743212"

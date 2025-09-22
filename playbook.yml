@@ -1,0 +1,31 @@
+---
+- name: Install Marzban using SSH password authentication
+  hosts: marzban_servers
+  become: true
+  vars:
+    marzban_script_url: "https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh"
+    marzban_install_dir: "/opt/marzban"
+    install_timeout: 300
+
+  tasks:
+  - name: Update apt package cache
+    apt:
+      update_cache: yes
+      cache_valid_time: 3600
+    tags: package-update
+
+  - name: "Import docker role"
+    import_role:
+      name: docker
+    tags: docker-install
+
+  - name: "Import marzban role"
+    import_role:
+      name: marzban
+    tags: marzban-install
+
+  handlers:
+  - name: restart marzban
+    community.docker.docker_compose_v2:
+      project_src: "{{ marzban_install_dir }}"
+      state: restarted

@@ -1,0 +1,4 @@
+---
+marzban_script_url: "https://github.com/Gozargah/Marzban-scripts/raw/master/marzban.sh"
+marzban_install_dir: "/opt/marzban"
+install_timeout: 300
